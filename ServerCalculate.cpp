@@ -1,168 +1,259 @@
 #include <iostream>
 #include <cstdint>
 #include <future>
-#include <optional>
-#include <cmath>
+#include <map>
+#include <string>
 
-#include <stdio.h> 
+#include <sys/time.h>
+#include <cstdlib>
 #include <stdlib.h> 
 #include <unistd.h>
 #include <sys/types.h> 
 #include <sys/socket.h> 
 #include <arpa/inet.h> 
-#include <netinet/in.h> 
-    
-#define PORT         1234 
+#include <netinet/in.h>
 
-#define REQUEST_SIG  0x12345678
-#define RESPONSE_SIG 0x87654321
+#include "./functions/trialfuncs.hpp"
+#include "./CancelationDialog.hpp"
 
-struct request_datagram
+#define PORT 2222
+#define TIMEOUT 5s
+
+std::string PROCESS_NAME = "";
+
+bool InProcess::IN_PROCESS = false;
+bool InProcess::PROMPT = true;
+bool InProcess::STOP_PROCESS = false;
+bool InProcess::CONTINUE_PROCESS = false;
+
+Response hard_fail_resp{RESPONSE_SIG_F, 0, "hard_fail", std::nan("hard_fail")};
+
+void attemptFail(int attempt_times)
 {
-    std::uint32_t sig;
-
-    double a;
-    double b;
-    double c;
-};
-
-struct response_datagram
-{
-    std::uint32_t sig;
-
-    double x1;
-    double x2;
-};
-
-response_datagram quadratic_equation(double a, double b, double c) {
-    double D = b * b - 4 * a * c;
-
-    if (D > 0) 
-    {
-        double x1 = (-b + sqrt(D)) / (2 * a);
-        double x2 = (-b - sqrt(D)) / (2 * a);
-
-        return {RESPONSE_SIG, x1, x2};
-    } 
-    else if (D == 0) 
-    {
-        double x = (-b) / (2 * a);
-        return {RESPONSE_SIG, x, x};
-    }
-    else
-        return {RESPONSE_SIG, std::nan(""), std::nan("")};
+    std::cout << "The function tried to be evaluated " << attempt_times << " times. Break." << std::endl;
 }
 
+void binaryOperation(double a, double b)
+{
+    std::cout << "Binary Operation (*): " << a * b << std::endl;
+}
 
-void run_server()
+Response f_function(double x)
+{
+    Response r;
+    r << os::lab1::compfuncs::trial_f<os::lab1::compfuncs::DOUBLE_MULT>(x);
+    return r;
+}
+
+Response g_function(double x)
+{
+    Response r;
+    r << os::lab1::compfuncs::trial_g<os::lab1::compfuncs::DOUBLE_MULT>(x);
+    return r;
+}
+
+void runProcess(std::string functionName, double x, int iterno) 
+{
+    std::system((PROCESS_NAME + " " + functionName + " " + std::to_string(x) + " " + std::to_string(iterno) + " &").c_str());
+}
+
+void recvfrom_process(int sockfd, sockaddr_in cliaddr, socklen_t len, std::map<std::string, Response> *res, int iterno)
+{
+    using namespace std::chrono_literals;
+
+    Response response;
+    auto ans = 0;
+
+    InProcess::PROMPT = true;
+    InProcess::STOP_PROCESS = false;
+    InProcess::CONTINUE_PROCESS = false;
+
+    int attempt_times = 0;
+
+    auto expire = std::chrono::system_clock::now() + TIMEOUT;
+    do
+    {
+        len = sizeof(cliaddr);
+        ans = ::recvfrom(sockfd, &response, sizeof(response), 0, (struct sockaddr *) &cliaddr, &len);
+        if (ans == -1)
+        {
+            if(InProcess::STOP_PROCESS)
+                break; //stop proc was pressed
+
+            if (errno == EINTR)
+                continue; //^C was pressed
+
+            if (!InProcess::IN_PROCESS && expire < std::chrono::system_clock::now() && InProcess::PROMPT) 
+            {
+                if (++attempt_times == 5 && !InProcess::CONTINUE_PROCESS)
+                {
+                    attemptFail(attempt_times);
+                    break;
+                }
+
+                InProcess busy;
+
+                std::string user_ans;
+
+                std::cout << "Answer timeout" 
+                          << std::endl << "Prompt:"
+                          << std::endl << "(a) continue" 
+                          << std::endl << "(b) continue without prompt" 
+                          << std::endl << "(c) stop" << std::endl;
+
+                std::cin >> user_ans;
+
+                if (user_ans == "a")
+                {
+                    expire = std::chrono::system_clock::now() + TIMEOUT;
+                    continue;
+                }
+                else if (user_ans == "b")
+                {
+                    InProcess::PROMPT = false;
+                    continue;
+                }
+                else if (user_ans == "c") 
+                    InProcess::STOP_PROCESS = true;
+            }
+
+            if (expire < std::chrono::system_clock::now())
+            {
+                if (++attempt_times == 5 && !InProcess::CONTINUE_PROCESS)
+                {
+                    attemptFail(attempt_times);
+                    break;
+                }
+                expire = std::chrono::system_clock::now() + TIMEOUT;
+            }
+        }
+        else if (ans > 0 && ans == sizeof(response) && iterno == response.iterno)
+        {   
+            if (response.sig == RESPONSE_SIG_F || response.sig == RESPONSE_SIG_G)
+            {   
+                // if (response.status != "ok")
+                //     std::cout << "Response failure: " << response.status << std::endl;
+
+                if (response.sig == RESPONSE_SIG_F)
+                    res->at("f") = response;
+                else
+                    res->at("g") = response;
+            }
+            else if (response.sig != RESPONSE_SIG_F || response.sig != RESPONSE_SIG_G)
+            {
+                std::cerr << "Signature failed" << std::endl;
+                continue;
+            }
+        }
+    }
+    while (ans == -1 || res->at("f").status == "hard_fail" || res->at("g").status == "hard_fail");
+}
+
+void run_manager()
 {
     int sockfd;
     socklen_t len;
     struct sockaddr_in servaddr, cliaddr;
 
-    // Creating socket file descriptor 
-    if ((sockfd = ::socket(AF_INET, SOCK_DGRAM, 0)) < 0 )
-    {
+    if ((sockfd = ::socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0)
         exit(EXIT_FAILURE); 
-    }
 
-    // Filling server information 
-    std::memset(&servaddr, 0, sizeof(servaddr)); 
-    servaddr.sin_family = AF_INET; 
-    servaddr.sin_port = htons(PORT); 
-    servaddr.sin_addr.s_addr = INADDR_ANY; 
+    struct timeval tv { 0, 200000 };
+    ::setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    // Bind the socket with the server address 
-    if (bind(sockfd, (const struct sockaddr *)&servaddr,  
-            sizeof(servaddr)) < 0 ) 
+    std::memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(PORT);
+    servaddr.sin_addr.s_addr = INADDR_ANY;
+
+    if (::bind(sockfd, (const struct sockaddr *) &servaddr, sizeof(servaddr)) < 0 ) 
     { 
         std::cerr << "Bind failed" << std::endl; 
         exit(EXIT_FAILURE); 
     }
 
-    request_datagram req;
+    std::thread thread(&cancelationDialog);
 
-    auto n = ::recvfrom(sockfd, &req, sizeof(req), MSG_WAITALL, (struct sockaddr *) &cliaddr, &len);
-
-    if (n == sizeof(req) && req.sig == REQUEST_SIG)
+    for(int iterno = 0; true; iterno++)
     {
-        std::cout << "Request : a = " << req.a << ", b = " << req.b << ", c = " << req.c << std::endl;
+        {
+            InProcess busy;
 
-        auto v = quadratic_equation(req.a, req.b, req.c);
+            int x;
 
-        std::cout << "x1 = " << v.x1 << ", x2 = " << v.x2 << std::endl;
+            std::cout << "Enter x: ";
+            std::cin >> x;
 
-        ::sendto(sockfd, &v, sizeof(v), 0, (const struct sockaddr *) &cliaddr, sizeof(cliaddr)); 
+            runProcess("f", x, iterno);
+            runProcess("g", x, iterno);
+        }
+
+        std::map<std::string, Response> res {{"f", hard_fail_resp}, {"g", hard_fail_resp}};
+        recvfrom_process(sockfd, cliaddr, len, &res, iterno);
+
+        if (res.size() == 2) {
+            for (const auto& [key, value] : res)
+                std::cout << '[' << key << "] status: "<< value.status << " = " << value.value << "; " << std::endl;;
+
+            if(res["f"].status == "ok" && res["g"].status == "ok")
+                binaryOperation(res["f"].value, res["g"].value);
+            else
+                std::cout << "Value failure!" << std::endl;
+        }
     }
-    else
-    {
-        std::cerr << "Unexpected request" << std::endl;
-    }
-
 }
 
-std::optional<response_datagram> run_client(double a, double b, double c)
+void run_client(std::string name, int x, int iterno)
 {
     int sockfd;
     socklen_t len;
     struct sockaddr_in servaddr; 
-    
-    // Creating socket file descriptor 
+
     if ((sockfd = ::socket(AF_INET, SOCK_DGRAM, 0)) < 0 )
     {
         std::cerr << "socket creation failed" << std::endl;
         exit(EXIT_FAILURE); 
     }
-    
-    // Filling server information 
+
     std::memset(&servaddr, 0, sizeof(servaddr)); 
     servaddr.sin_family = AF_INET; 
     servaddr.sin_port = htons(PORT); 
-    servaddr.sin_addr.s_addr = INADDR_ANY; 
+    servaddr.sin_addr.s_addr = INADDR_ANY;
 
-    // Send request
-    request_datagram req{ REQUEST_SIG, a, b, c };
-    ::sendto(sockfd, &req, sizeof(req), 0, (const struct sockaddr *) &servaddr,  sizeof(servaddr));
+    auto function_res = name == "f" ?
+        std::async(std::launch::async, &f_function, x) :   
+        std::async(std::launch::async, &g_function, x);    
 
-    // Receive response
-    response_datagram res;
-    auto n = ::recvfrom(sockfd, &res, sizeof(res), MSG_WAITALL, (struct sockaddr *) &servaddr, &len);
+    auto res = function_res.get();
+
+    res.sig = name == "f" ? RESPONSE_SIG_F : RESPONSE_SIG_G;
+    res.iterno = iterno;
+
+    ::sendto(sockfd, &res, sizeof(res), 0, (const struct sockaddr *) &servaddr,  sizeof(servaddr));
+
     ::close(sockfd);
-
-    if (n == sizeof(res) && res.sig == RESPONSE_SIG) 
-    {
-        return res;
-    }
-    else
-        return { };
 }
 
 int main(int argc, char *argv[])
 {
     if (argc == 1)
     {
-        std::cout << "Running server..." << std::endl;
-        run_server();
+        PROCESS_NAME.assign(argv[0], 17);
+        std::cout << "Running Manager..." << std::endl;
+        run_manager();
     }
     else if (argc == 4)
     {
-        auto a = std::atof(argv[1]);
-        auto b = std::atof(argv[2]);
-        auto c = std::atof(argv[3]);
+        std::string name (argv[1]);
+        auto x      = std::atof(argv[2]);
+        auto iterno = std::atof(argv[3]);
 
-        std::cout << "Running client: a = " << a << ", b = " << b << ", c = " << c << std::endl;
-        auto x = std::async(std::launch::async, &run_client, a, b, c);
-        auto r = x.get();
-        if (r.has_value())
-        {
-            auto const &v = r.value();
-            std::cout << "x1 = " << v.x1 << ", x2 = " << v.x2 << std::endl;
-        }
-        else
-            std::cerr << "Unexpected response" << std::endl;
+        std::cout << "Running Client... " << name << std::endl;
+
+        run_client(name, x, iterno);
     }
     else
-        std::cerr << "Numbers a b c expected" << std::endl;
-
+        std::cerr << "Argument expected" << std::endl;
+    
     return 0;
 }
